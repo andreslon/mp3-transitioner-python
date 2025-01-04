@@ -1,57 +1,67 @@
 import os
-from mutagen.easyid3 import EasyID3
-from mutagen.mp3 import MP3
+import subprocess
+import numpy as np
+from scipy.io import wavfile
 
-def smooth_transition(audio1_path, audio2_path, output_path, transition_duration_ms=5000):
-    audio1 = load_audio(audio1_path)
-    audio2 = load_audio(audio2_path)
+def convert_to_wav(mp3_path, wav_path):
+    command = f"ffmpeg -i {mp3_path} {wav_path} -y"
+    subprocess.run(command, shell=True, check=True)
 
-    audio1_duration = len(audio1)
-    audio2_duration = len(audio2)
-
-    fade_out_start = max(0, audio1_duration - transition_duration_ms)
-    fade_in_end = min(transition_duration_ms, audio2_duration)
-
-    combined = (
-        audio1[:fade_out_start] + 
-        crossfade(audio1[fade_out_start:], audio2[:fade_in_end]) + 
-        audio2[fade_in_end:]
+def get_audio_duration(wav_path):
+    result = subprocess.run(
+        f"ffprobe -i {wav_path} -show_entries format=duration -v quiet -of csv=\"p=0\"",
+        shell=True, capture_output=True, text=True
     )
+    return float(result.stdout.strip())
 
-    save_audio(combined, output_path, {**get_metadata(audio1_path), **get_metadata(audio2_path)})
-    print(f"File exported to: {output_path}")
+def detect_low_activity_segment(wav_path, segment_duration=2):
+    rate, data = wavfile.read(wav_path)
+    if len(data.shape) > 1:
+        data = np.mean(data, axis=1)
+    segment_samples = int(rate * segment_duration)
+    min_energy = float('inf')
+    start_sample = 0
+    for i in range(0, len(data) - segment_samples, segment_samples):
+        segment = data[i:i + segment_samples]
+        energy = np.sum(np.abs(segment))
+        if energy < min_energy:
+            min_energy = energy
+            start_sample = i
+    return start_sample, rate
 
-def load_audio(audio_path):
-    audio = MP3(audio_path)
-    with open(audio_path, "rb") as f:
-        return f.read()
+def create_transition(wav1_path, wav2_path, output_path):
+    fade_duration_s = 5
 
-def save_audio(audio_data, output_path, metadata):
-    with open(output_path, "wb") as f:
-        f.write(audio_data)
-    audio = MP3(output_path)
-    valid_keys = EasyID3.valid_keys.keys()
-    for key, value in metadata.items():
-        if key in valid_keys:
-            try:
-                audio[key] = str(value) if not isinstance(value, list) else [str(v) for v in value]
-            except Exception as e:
-                print(f"Error saving metadata {key}: {e}")
-    audio.save()
+    duration1 = get_audio_duration(wav1_path)
+    duration2 = get_audio_duration(wav2_path)
 
-def crossfade(audio1_data, audio2_data):
-    length = min(len(audio1_data), len(audio2_data))
-    return bytes(
-        int(a1 * (1 - i / length) + a2 * (i / length)) for i, (a1, a2) in enumerate(zip(audio1_data, audio2_data))
+    # Ensure fade duration is within bounds
+    fade_out_start = max(0, duration1 - fade_duration_s)
+    fade_in_start = 0
+
+    command = (
+        f"ffmpeg -i {wav1_path} -i {wav2_path} -filter_complex "
+        f"[0:a]afade=t=out:st={fade_out_start}:d={fade_duration_s}[a0];"
+        f"[1:a]atrim=start={fade_in_start},afade=t=in:st=0:d={fade_duration_s}[a1];"
+        f"[a0][a1]concat=n=2:v=0:a=1[a] "
+        f"-map [a] -b:a 320k {output_path} -y"
     )
+    subprocess.run(command, shell=True, check=True)
 
-def get_metadata(audio_path):
-    try:
-        audio = EasyID3(audio_path)
-        return {k: (v[0] if isinstance(v, list) else v) for k, v in dict(audio).items()}
-    except Exception as e:
-        print(f"Error loading metadata: {e}")
-        return {}
+def smooth_transition(audio1_path, audio2_path, output_path):
+    wav1_path = "temp1.wav"
+    wav2_path = "temp2.wav"
+
+    convert_to_wav(audio1_path, wav1_path)
+    convert_to_wav(audio2_path, wav2_path)
+
+    create_transition(wav1_path, wav2_path, output_path)
+
+    # Clean up temporary files
+    os.remove(wav1_path)
+    os.remove(wav2_path)
+
+    print(f"Transition completed and exported to: {output_path}")
 
 def main():
     audio1_path = "songs/00000111011025_T53_audtrk.mp3"
